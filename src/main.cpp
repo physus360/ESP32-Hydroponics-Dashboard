@@ -16,14 +16,21 @@ const char* password = WIFI_PASSWORD;
 #define API_KEY        FIREBASE_API_KEY
 #define DATABASE_URL   FIREBASE_DATABASE_URL
 
-FirebaseData   fbdo;       // Dedicated stream handle
+FirebaseData   fbdo;       // Dedicated stream handle (/control/pumpOverride)
 FirebaseData   fbdoUpload; // Dedicated upload handle
+FirebaseData   fbdoCamera; // Dedicated stream handle (/camera/detection) — companion ESP32-CAM board's OpenAI analysis, read-only from this board
 FirebaseAuth   auth;
 FirebaseConfig config;
 
 bool firebaseReady = false;
 unsigned long lastFbUpload = 0;
 const unsigned long FB_UPLOAD_INTERVAL = 3000; // Upload data every 3s
+
+// Plant status from the companion camera board's OpenAI analysis (written to /camera/detection
+// by a Cloud Function, not by this board). Surfaced in Serial logs and the /sensor upload only —
+// deliberately not wired into pump control, since an LLM call has no place in that safety path.
+String plantStatus = "UNKNOWN";
+String plantNote = "";
 
 unsigned long lastWifiRetry = 0;
 const unsigned long WIFI_RETRY_INTERVAL = 30000; // Retry Wi-Fi (and Firebase init) every 30s while disconnected
@@ -80,18 +87,23 @@ void initFirebase() {
     // Fix: Increase buffer breathing room for SSL/TLS handshakes
     fbdo.setBSSLBufferSize(3072, 1024);
     fbdoUpload.setBSSLBufferSize(3072, 1024);
-    
+    fbdoCamera.setBSSLBufferSize(3072, 1024);
+
     // Fix: Cap the maximum response buffer length to prevent payload read timeouts
     fbdoUpload.setResponseSize(512);
 
     if (!Firebase.RTDB.beginStream(&fbdo, "/control/pumpOverride")) {
         Serial.printf("Stream begin failed: %s\n", fbdo.errorReason().c_str());
     }
+
+    if (!Firebase.RTDB.beginStream(&fbdoCamera, "/camera/detection")) {
+        Serial.printf("Camera detection stream begin failed: %s\n", fbdoCamera.errorReason().c_str());
+    }
 }
 
 void pollFirebaseStream() {
     if (!firebaseReady) return;
-    
+
     // Non-blocking background stream listener
     if (Firebase.RTDB.readStream(&fbdo)) {
         if (fbdo.streamAvailable()) {
@@ -99,6 +111,22 @@ void pollFirebaseStream() {
                 pumpOverride = fbdo.intData();
                 Serial.printf("\n[CLOUD] Pump override changed -> %d\n", pumpOverride);
             }
+        }
+    }
+}
+
+void pollCameraStream() {
+    if (!firebaseReady) return;
+
+    // Non-blocking background stream listener — mirrors pollFirebaseStream() above but for
+    // the camera board's /camera/detection node, which is a JSON object: {status, note, ts}.
+    if (Firebase.RTDB.readStream(&fbdoCamera)) {
+        if (fbdoCamera.streamAvailable() && fbdoCamera.dataType() == "json") {
+            FirebaseJson *json = fbdoCamera.jsonObjectPtr();
+            FirebaseJsonData result;
+            if (json->get(result, "status")) plantStatus = result.stringValue;
+            if (json->get(result, "note"))   plantNote = result.stringValue;
+            Serial.printf("\n[CAM] Plant status -> %s (%s)\n", plantStatus.c_str(), plantNote.c_str());
         }
     }
 }
@@ -113,6 +141,8 @@ void uploadToFirebase() {
     json.set("pump", isFilling ? "RUNNING" : "IDLE");
     json.set("water_status", waterStatusStr);
     json.set("override", pumpOverride);
+    json.set("plantStatus", plantStatus);
+    json.set("plantNote", plantNote);
     json.set("ts", (int)(millis() / 1000));
 
     // Fix: Using updateNode minimizes transmitted packet size, significantly stopping payload timeouts
@@ -177,8 +207,9 @@ void loop() {
         initFirebase();
     }
 
-    // 1. Keep stream connection open continuously
+    // 1. Keep stream connections open continuously
     pollFirebaseStream();
+    pollCameraStream();
 
     // 2. Independent Sensor & Automation Loop (Runs every 1 second)
     if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {

@@ -53,8 +53,10 @@ Then fill in real values in `include/secrets.h`:
 
 ## Firebase data model
 
-- Writes to `/sensor`: `temperature`, `tds`, `ph`, `pump` (`RUNNING`/`IDLE`), `water_status`, `override`, `ts`
+- Writes to `/sensor`: `temperature`, `tds`, `ph`, `pump` (`RUNNING`/`IDLE`), `water_status`, `override`, `plantStatus`, `plantNote`, `ts`
 - Reads (streamed) from `/control/pumpOverride`: `-1` = AUTO, `0` = force pump off, `1` = force pump on
+- Reads (streamed) from `/camera/detection`: `{ status, note, ts }` — plant health analysis from a companion ESP32-CAM board (see the `esp32s3-test` project), run through OpenAI's vision API by a Cloud Function. Purely informational — folded into the `/sensor` upload for the dashboard, never wired into pump control.
+- Written by the companion camera board (not this board) to `/camera/latest`: `{ url, ts }` — a daily snapshot photo, re-uploaded to the same Storage path each day.
 
 ## Dependencies
 
