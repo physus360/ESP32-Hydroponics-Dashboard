@@ -25,6 +25,9 @@ bool firebaseReady = false;
 unsigned long lastFbUpload = 0;
 const unsigned long FB_UPLOAD_INTERVAL = 3000; // Upload data every 3s
 
+unsigned long lastWifiRetry = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 30000; // Retry Wi-Fi (and Firebase init) every 30s while disconnected
+
 // Pump override from cloud: -1 = AUTO, 0 = force OFF, 1 = force ON
 volatile int pumpOverride = -1;
 
@@ -51,6 +54,10 @@ String waterStatusStr = "NORMAL";
 
 unsigned long lastSensorUpdate = 0;
 const unsigned long SENSOR_INTERVAL = 1000; // Read sensors every 1s
+
+unsigned long fillStartTime = 0;
+const unsigned long MAX_FILL_DURATION = 180000; // 3 min safety cutoff if a float switch never reports "full"
+bool fillTimeoutFault = false; // Latched until the tank is actually full or the operator force-stops the pump
 
 void initFirebase() {
     config.api_key = API_KEY;
@@ -156,7 +163,21 @@ void setup() {
 }
 
 void loop() {
-    // 1. Keep stream connection open continuously 
+    // 0. Recover from a failed/dropped Wi-Fi connection instead of staying offline forever.
+    // setup() only tries once; without this, a bad connection at boot freezes Firebase
+    // permanently since initFirebase() would never get called.
+    if (WiFi.status() != WL_CONNECTED) {
+        if (millis() - lastWifiRetry >= WIFI_RETRY_INTERVAL) {
+            lastWifiRetry = millis();
+            Serial.println("\n[WiFi] Not connected — retrying...");
+            WiFi.reconnect();
+        }
+    } else if (!firebaseReady) {
+        Serial.println("\n[WiFi] Connected — initializing Firebase...");
+        initFirebase();
+    }
+
+    // 1. Keep stream connection open continuously
     pollFirebaseStream();
 
     // 2. Independent Sensor & Automation Loop (Runs every 1 second)
@@ -184,11 +205,23 @@ void loop() {
         bool topSwitchOpen = (digitalRead(WATER_HIGH_PIN) == HIGH);
         bool topSwitchClosed = !topSwitchOpen;
 
+        // A latched fill-timeout fault only clears once the tank is verifiably full or the
+        // operator explicitly stops the pump — otherwise a stuck switch would just quietly
+        // retry (and time out) forever instead of surfacing a persistent error.
+        if (fillTimeoutFault && (topSwitchClosed || pumpOverride == 0)) {
+            fillTimeoutFault = false;
+        }
+
         // Water automation with cloud override + float-switch safety limits
         if (lowSwitchOpen && topSwitchClosed) {
             isFilling = false;
             digitalWrite(RELAY_1, HIGH);
             waterStatusStr = "SENSOR ERROR";
+        }
+        else if (fillTimeoutFault) {
+            isFilling = false;
+            digitalWrite(RELAY_1, HIGH);
+            waterStatusStr = "FILL TIMEOUT ERROR";
         }
         else if (pumpOverride == 1) {
             if (topSwitchClosed) {
@@ -196,9 +229,17 @@ void loop() {
                 digitalWrite(RELAY_1, HIGH);
                 waterStatusStr = "TANK FULL";
             } else {
+                if (!isFilling) fillStartTime = millis();
                 isFilling = true;
-                digitalWrite(RELAY_1, LOW);
-                waterStatusStr = "FORCE FILLING";
+                if (millis() - fillStartTime >= MAX_FILL_DURATION) {
+                    fillTimeoutFault = true;
+                    isFilling = false;
+                    digitalWrite(RELAY_1, HIGH);
+                    waterStatusStr = "FILL TIMEOUT ERROR";
+                } else {
+                    digitalWrite(RELAY_1, LOW);
+                    waterStatusStr = "FORCE FILLING";
+                }
             }
         }
         else if (pumpOverride == 0) {
@@ -212,12 +253,18 @@ void loop() {
                     isFilling = false;
                     digitalWrite(RELAY_1, HIGH);
                     waterStatusStr = "TANK FULL";
+                } else if (millis() - fillStartTime >= MAX_FILL_DURATION) {
+                    fillTimeoutFault = true;
+                    isFilling = false;
+                    digitalWrite(RELAY_1, HIGH);
+                    waterStatusStr = "FILL TIMEOUT ERROR";
                 } else {
                     digitalWrite(RELAY_1, LOW);
                     waterStatusStr = "REFILLING...";
                 }
             } else {
                 if (lowSwitchOpen) {
+                    fillStartTime = millis();
                     isFilling = true;
                     digitalWrite(RELAY_1, LOW);
                     waterStatusStr = "REFILLING...";
